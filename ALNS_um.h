@@ -104,7 +104,8 @@ public:
         long long pattern_mining_variables_fixed = 0;
     };
 
-    explicit ALNSUM(const InstanceUM& instance, Parameters parameters = Parameters{});
+    explicit ALNSUM(const InstanceUM& instance);
+    ALNSUM(const InstanceUM& instance, Parameters parameters);
 
     // Executa o ALNS completo e devolve a melhor solucao encontrada.
     Solution solve();

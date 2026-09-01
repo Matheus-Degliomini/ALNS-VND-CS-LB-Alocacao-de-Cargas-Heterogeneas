@@ -13,6 +13,9 @@
 #include <stdexcept>
 #include <unordered_map>
 
+ALNSUM::ALNSUM(const InstanceUM& instance)
+    : ALNSUM(instance, Parameters{}) {}
+
 ALNSUM::ALNSUM(const InstanceUM& instance, Parameters parameters)
     : instance_(instance), parameters_(parameters), rng_(parameters.random_seed) {
     buildDemandList();
