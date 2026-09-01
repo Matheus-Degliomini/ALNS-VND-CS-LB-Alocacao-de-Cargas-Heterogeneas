@@ -11,6 +11,7 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <unordered_map>
 
 ALNSUM::ALNSUM(const InstanceUM& instance, Parameters parameters)
     : instance_(instance), parameters_(parameters), rng_(parameters.random_seed) {
@@ -1478,6 +1479,10 @@ bool ALNSUM::processSolutionInClusteringSearch(Solution& solution, Solution& bes
         return false;
     }
 
+    // Toda solucao aceita alimenta o pool de elite, base da mineracao de padroes
+    // usada para fixar variaveis nas chamadas de Local Branching.
+    updateElitePool(solution);
+
     const int cluster_index = findNearestClusterIndex(solution);
     if (cluster_index < 0) {
         return false;
@@ -1531,11 +1536,24 @@ bool ALNSUM::intensifyClusterWithLocalBranching(Cluster& cluster, Solution& best
     ++cs_local_branching_calls_;
 
     Solution improved;
+    int mined_variables_fixed = 0;
     const auto local_branching_start = std::chrono::steady_clock::now();
-    const bool local_branching_found_solution = solveLocalBranchingAroundCenter(cluster.center, improved);
+    const bool local_branching_found_solution = solveLocalBranchingAroundCenter(
+        cluster.center,
+        improved,
+        parameters_.local_branching_radius,
+        parameters_.demand_local_branching_radius,
+        parameters_.local_branching_time_limit,
+        &mined_variables_fixed
+    );
     const auto local_branching_end = std::chrono::steady_clock::now();
     cs_local_branching_seconds_ +=
         std::chrono::duration<double>(local_branching_end - local_branching_start).count();
+
+    if (mined_variables_fixed > 0) {
+        ++cs_pattern_mining_calls_;
+        cs_pattern_mining_variables_fixed_ += mined_variables_fixed;
+    }
 
     if (!local_branching_found_solution) {
         ++cluster.inefficacy;
@@ -1564,6 +1582,135 @@ bool ALNSUM::intensifyClusterWithLocalBranching(Cluster& cluster, Solution& best
     return false;
 }
 
+// Atualiza o pool de solucoes de elite usado pela mineracao de padroes.
+// O pool guarda ate pattern_mining_pool_size solucoes distintas (por objetivo), sempre
+// substituindo a pior quando uma solucao melhor aparece. Isso mantem uma amostra das
+// regioes mais promissoras ja visitadas pelo ALNS, sem se limitar a um unico centro.
+void ALNSUM::updateElitePool(const Solution& solution) {
+    if (!parameters_.enable_pattern_mining) {
+        return;
+    }
+
+    for (const Solution& existing : elite_pool_) {
+        if (std::abs(existing.objective - solution.objective) < 1e-6) {
+            return;
+        }
+    }
+
+    const int max_pool_size = std::max(1, parameters_.pattern_mining_pool_size);
+    if (static_cast<int>(elite_pool_.size()) < max_pool_size) {
+        elite_pool_.push_back(solution);
+        return;
+    }
+
+    auto worst_it = std::max_element(
+        elite_pool_.begin(),
+        elite_pool_.end(),
+        [](const Solution& lhs, const Solution& rhs) { return lhs.objective < rhs.objective; }
+    );
+    if (worst_it != elite_pool_.end() && solution.objective + 1e-9 < worst_it->objective) {
+        *worst_it = solution;
+    }
+}
+
+// Mineracao de padroes frequentes sobre o pool de elite (Data Mining aplicado ao LB).
+// Para cada demanda (item,cliente), conta por votacao qual veiculo a atende (ou se ela
+// fica sem atendimento) em cada solucao do pool. Quando o suporte de um padrao supera
+// o limiar configurado, a variavel correspondente e fixada por bound, reduzindo o
+// tamanho do MIP resolvido pelo Gurobi e liberando tempo/raio para o restante do espaco.
+int ALNSUM::applyMinedVariableFixings(
+    std::vector<GRBVar>& y,
+    std::vector<std::vector<std::vector<GRBVar>>>& x,
+    const std::vector<std::vector<std::vector<bool>>>& x_exists
+) const {
+    const int pool_size = static_cast<int>(elite_pool_.size());
+    if (!parameters_.enable_pattern_mining ||
+        pool_size < std::max(1, parameters_.pattern_mining_min_pool_size)) {
+        return 0;
+    }
+
+    const double support_threshold =
+        std::min(1.0, std::max(0.5, parameters_.pattern_mining_support_threshold));
+    const auto& metadata = instance_.getMetadata();
+    const auto& psi = instance_.getPsi();
+
+    int fixed_count = 0;
+    std::vector<bool> vehicle_forced_active(metadata.num_veiculos, false);
+
+    // Fixa por demanda o veiculo majoritario (ou o nao atendimento) quando o suporte
+    // no pool de elite for alto o suficiente.
+    for (const Demand& demand : demands_) {
+        std::unordered_map<int, int> votes;
+        int unserved_votes = 0;
+        for (const Solution& elite : elite_pool_) {
+            const int assigned = elite.assigned_vehicle[demand.item_id][demand.client_id];
+            if (assigned >= 0) {
+                ++votes[assigned];
+            } else if (assigned == -1) {
+                ++unserved_votes;
+            }
+        }
+
+        int majority_vehicle = -1;
+        int majority_votes = 0;
+        for (const auto& vote : votes) {
+            if (vote.second > majority_votes) {
+                majority_votes = vote.second;
+                majority_vehicle = vote.first;
+            }
+        }
+
+        if (majority_vehicle >= 0 &&
+            x_exists[demand.item_id][majority_vehicle][demand.client_id] &&
+            static_cast<double>(majority_votes) / pool_size >= support_threshold) {
+            x[demand.item_id][majority_vehicle][demand.client_id].set(GRB_DoubleAttr_LB, 1.0);
+            x[demand.item_id][majority_vehicle][demand.client_id].set(GRB_DoubleAttr_UB, 1.0);
+            vehicle_forced_active[majority_vehicle] = true;
+            ++fixed_count;
+
+            for (int vehicle_id : psi[demand.item_id]) {
+                if (vehicle_id != majority_vehicle && x_exists[demand.item_id][vehicle_id][demand.client_id]) {
+                    x[demand.item_id][vehicle_id][demand.client_id].set(GRB_DoubleAttr_UB, 0.0);
+                }
+            }
+        } else if (static_cast<double>(unserved_votes) / pool_size >= support_threshold) {
+            for (int vehicle_id : psi[demand.item_id]) {
+                if (x_exists[demand.item_id][vehicle_id][demand.client_id]) {
+                    x[demand.item_id][vehicle_id][demand.client_id].set(GRB_DoubleAttr_UB, 0.0);
+                }
+            }
+            ++fixed_count;
+        }
+    }
+
+    // Fixa veiculos que o pool de elite nunca usa ou sempre usa, reduzindo o espaco de
+    // busca sobre y. Veiculos com uma demanda ja forcada a ativa sao preservados para
+    // nao gerar um par de fixacoes contraditorio (x=1 exigindo y=1, com y fixado em 0).
+    for (int vehicle_id = 0; vehicle_id < metadata.num_veiculos; ++vehicle_id) {
+        if (vehicle_forced_active[vehicle_id]) {
+            continue;
+        }
+
+        int active_votes = 0;
+        for (const Solution& elite : elite_pool_) {
+            if (elite.vehicle_num_assignments[vehicle_id] > 0) {
+                ++active_votes;
+            }
+        }
+
+        const double active_support = static_cast<double>(active_votes) / pool_size;
+        if (active_support <= 1.0 - support_threshold) {
+            y[vehicle_id].set(GRB_DoubleAttr_UB, 0.0);
+            ++fixed_count;
+        } else if (active_support >= support_threshold) {
+            y[vehicle_id].set(GRB_DoubleAttr_LB, 1.0);
+            ++fixed_count;
+        }
+    }
+
+    return fixed_count;
+}
+
 // Resolve um subproblema de Local Branching ao redor do centro do cluster.
 // Se ainda ha veiculos inativos, usamos a vizinhanca de frota:
 //   sum_{ativos}(1-y_v) + sum_{inativos} y_v <= k_y.
@@ -1586,7 +1733,8 @@ bool ALNSUM::solveLocalBranchingAroundCenter(
     Solution& improved_solution,
     int vehicle_radius,
     int demand_radius,
-    double time_limit
+    double time_limit,
+    int* mined_variables_fixed
 ) const {
     try {
         const auto& metadata = instance_.getMetadata();
@@ -1665,6 +1813,13 @@ bool ALNSUM::solveLocalBranchingAroundCenter(
                     );
                 }
             }
+        }
+
+        // Mineracao de padroes: fixa variaveis x/y com alto suporte no pool de elite
+        // antes de montar o restante do modelo, reduzindo o MIP resolvido pelo Gurobi.
+        const int mined_fixed_count = applyMinedVariableFixings(y, x, x_exists);
+        if (mined_variables_fixed != nullptr) {
+            *mined_variables_fixed = mined_fixed_count;
         }
 
         // Funcao objetivo identica a avaliacao do ALNS/P2: custo fixo + frete morto
@@ -1824,13 +1979,20 @@ bool ALNSUM::applyFinalIntensification(Solution& best) {
     }
 
     Solution improved;
+    int mined_variables_fixed = 0;
     const bool found_solution = solveLocalBranchingAroundCenter(
         best,
         improved,
         parameters_.final_local_branching_radius,
         parameters_.final_demand_local_branching_radius,
-        parameters_.final_local_branching_time_limit
+        parameters_.final_local_branching_time_limit,
+        &mined_variables_fixed
     );
+
+    if (mined_variables_fixed > 0) {
+        ++cs_pattern_mining_calls_;
+        cs_pattern_mining_variables_fixed_ += mined_variables_fixed;
+    }
 
     if (found_solution && improved.objective + 1e-9 < best.objective) {
         best = improved;
@@ -1847,6 +2009,9 @@ ALNSUM::Solution ALNSUM::solve() {
     cs_local_branching_seconds_ = 0.0;
     cs_local_branching_calls_ = 0;
     cs_local_branching_improvements_ = 0;
+    elite_pool_.clear();
+    cs_pattern_mining_calls_ = 0;
+    cs_pattern_mining_variables_fixed_ = 0;
 
     const auto initial_solution_start = std::chrono::steady_clock::now();
     Solution current = buildInitialSolution();
@@ -2096,6 +2261,8 @@ ALNSUM::Solution ALNSUM::solve() {
     best.final_intensification_seconds = final_intensification_seconds;
     best.final_intensification_calls = final_intensification_calls;
     best.final_intensification_improvements = final_intensification_improvements;
+    best.pattern_mining_calls = cs_pattern_mining_calls_;
+    best.pattern_mining_variables_fixed = cs_pattern_mining_variables_fixed_;
 
     return best;
 }
@@ -2131,6 +2298,10 @@ void ALNSUM::printSolutionSummary(const Solution& solution, std::ostream& out) c
     out << "  melhorias por Local Branching = " << solution.local_branching_improvements << '\n';
     out << "  chamadas de intensificacao final = " << solution.final_intensification_calls << '\n';
     out << "  melhorias na intensificacao final = " << solution.final_intensification_improvements << "\n\n";
+
+    out << "Mineracao de padroes (Data Mining):\n";
+    out << "  chamadas de LB com variaveis fixadas = " << solution.pattern_mining_calls << '\n';
+    out << "  total de variaveis fixadas = " << solution.pattern_mining_variables_fixed << "\n\n";
 
     // Resume a utilizacao da frota.
     for (std::size_t vehicle_id = 0; vehicle_id < veiculos.size(); ++vehicle_id) {
@@ -2194,7 +2365,8 @@ void ALNSUM::exportSolutionCsv(const Solution& solution, const std::string& outp
     out << "record_type,entity_id,objective,iterations,runtime_seconds,stop_reason,cs_calls,lb_calls,"
            "lb_improvements,cs_seconds,lb_seconds,final_seconds,final_calls,final_improvements,used,dead_freight,"
            "weight_load,weight_capacity,volume_load,volume_capacity,item_id,client_id,vehicle_id,served,"
-           "prob_final,total_uses,total_accepts,failed_acceptance,total_improvements\n";
+           "prob_final,total_uses,total_accepts,failed_acceptance,total_improvements,"
+           "pattern_mining_calls,pattern_mining_variables_fixed\n";
 
     out << "summary,global," << solution.objective << "," << solution.iterations_performed << ","
         << solution.runtime_seconds << "," << solution.stop_reason
@@ -2206,7 +2378,9 @@ void ALNSUM::exportSolutionCsv(const Solution& solution, const std::string& outp
         << "," << solution.final_intensification_seconds
         << "," << solution.final_intensification_calls
         << "," << solution.final_intensification_improvements
-        << ",,,,,,,,,,,,,,\n";
+        << ",,,,,,,,,,,,,,"
+        << "," << solution.pattern_mining_calls
+        << "," << solution.pattern_mining_variables_fixed << "\n";
 
     for (std::size_t vehicle_id = 0; vehicle_id < veiculos.size(); ++vehicle_id) {
         const bool used = solution.vehicle_num_assignments[vehicle_id] > 0;
@@ -2218,27 +2392,27 @@ void ALNSUM::exportSolutionCsv(const Solution& solution, const std::string& outp
             << (used ? 1 : 0) << "," << dead_freight << ","
             << solution.vehicle_weight_load[vehicle_id] << "," << veiculos[vehicle_id].capacidade_peso << ","
             << solution.vehicle_volume_load[vehicle_id] << "," << veiculos[vehicle_id].capacidade_volume
-            << ",,,,,,,,,\n";
+            << ",,,,,,,,,,\n";
     }
 
     for (const Demand& demand : demands_) {
         const int assigned_vehicle = solution.assigned_vehicle[demand.item_id][demand.client_id];
         out << "demand,,,,,,,,,,,,,,,,,,,,"
             << demand.item_id << "," << demand.client_id << "," << assigned_vehicle << ","
-            << (assigned_vehicle >= 0 ? 1 : 0) << ",,,,,\n";
+            << (assigned_vehicle >= 0 ? 1 : 0) << ",,,,,,\n";
     }
 
     for (const OperatorStats& op : destroy_operators_) {
         const int failed_acceptance = op.total_uses - op.total_accepts;
         out << "destroy_operator," << op.name << ",,,,,,,,,,,,,,,,,,,,,,,,"
             << op.weight << "," << op.total_uses << "," << op.total_accepts << ","
-            << failed_acceptance << "," << op.total_improvements << "\n";
+            << failed_acceptance << "," << op.total_improvements << ",,\n";
     }
 
     for (const OperatorStats& op : repair_operators_) {
         const int failed_acceptance = op.total_uses - op.total_accepts;
         out << "repair_operator," << op.name << ",,,,,,,,,,,,,,,,,,,,,,,,"
             << op.weight << "," << op.total_uses << "," << op.total_accepts << ","
-            << failed_acceptance << "," << op.total_improvements << "\n";
+            << failed_acceptance << "," << op.total_improvements << ",,\n";
     }
 }
