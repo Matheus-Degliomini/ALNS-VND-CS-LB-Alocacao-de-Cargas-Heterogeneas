@@ -8,11 +8,30 @@
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Uso: " << argv[0] << " <arquivo_instancia>\n";
+        std::cerr << "Uso: " << argv[0] << " <arquivo_instancia> [seed]\n";
         return 1;
     }
 
     const std::string instance_path = argv[1];
+
+    // Seed opcional: se nao for informada, mantem o valor padrao (42).
+    unsigned int seed = 42U;
+    bool seed_provided = false;
+    if (argc >= 3) {
+        try {
+            size_t pos = 0;
+            unsigned long parsed_seed = std::stoul(argv[2], &pos);
+            if (pos != std::string(argv[2]).size()) {
+                throw std::invalid_argument("caracteres invalidos apos o numero");
+            }
+            seed = static_cast<unsigned int>(parsed_seed);
+            seed_provided = true;
+        } catch (const std::exception&) {
+            std::cerr << "Erro: seed invalida '" << argv[2]
+                       << "'. Informe um numero inteiro nao negativo.\n";
+            return 1;
+        }
+    }
 
     try {
         // Le a instancia usando a mesma classe parser ja usada pelo modelo exato.
@@ -41,7 +60,7 @@ int main(int argc, char* argv[]) {
         parameters.initial_temperature = 5000.0;
         parameters.cooling_rate = 0.995;
         parameters.reaction_factor = 0.25;
-        parameters.random_seed = 42U;
+        parameters.random_seed = seed;
         parameters.enable_vnd = true;
         parameters.enable_clustering_search = true;
         parameters.num_clusters = 8;
@@ -57,17 +76,23 @@ int main(int argc, char* argv[]) {
         parameters.final_demand_local_branching_radius = 40;
         parameters.final_local_branching_time_limit = 30.0;
 
+        std::cout << "Seed utilizada: " << parameters.random_seed
+                   << (seed_provided ? " (informada via parametro)\n" : " (valor padrao)\n");
+
         ALNSUM alns(instance, parameters);
         const ALNSUM::Solution best_solution = alns.solve();
         alns.printSolutionSummary(best_solution, std::cout);
+
 
         const std::filesystem::path results_dir = std::filesystem::current_path() / "results_alns";
         std::filesystem::create_directories(results_dir);
         const std::filesystem::path instance_file(instance_path);
         const std::filesystem::path csv_path =
-            results_dir / ("alns_" + instance_file.stem().string() + ".csv");
+            results_dir / ("alns_" + instance_file.stem().string() +
+                            "_seed" + std::to_string(parameters.random_seed) + ".csv");
         alns.exportSolutionCsv(best_solution, csv_path.string());
         std::cout << "CSV da solucao salvo em: " << csv_path.string() << '\n';
+
     } catch (const std::exception& ex) {
         std::cerr << "Erro: " << ex.what() << '\n';
         return 1;

@@ -44,6 +44,16 @@ public:
         int final_local_branching_radius = 12;
         int final_demand_local_branching_radius = 40;
         double final_local_branching_time_limit = 30.0;
+
+        // Mineracao de padroes frequentes (Data Mining) sobre um pool de solucoes de
+        // elite, usada para fixar variaveis antes de cada chamada de Local Branching.
+        // Reduz o tamanho do MIP resolvido pelo Gurobi, permitindo explorar raios
+        // maiores ou usar melhor o tempo disponivel.
+        bool enable_pattern_mining = true;
+        int pattern_mining_pool_size = 30;
+        int pattern_mining_min_pool_size = 25;
+        double pattern_mining_support_threshold = 0.75;
+
     };
 
     // Representa uma demanda elementar do problema: item i exigido pelo cliente c.
@@ -89,9 +99,14 @@ public:
         double final_intensification_seconds = 0.0;
         int final_intensification_calls = 0;
         int final_intensification_improvements = 0;
+
+        // Estatisticas da mineracao de padroes usada para fixar variaveis no Local Branching.
+        int pattern_mining_calls = 0;
+        long long pattern_mining_variables_fixed = 0;
     };
 
-    explicit ALNSUM(const InstanceUM& instance, Parameters parameters = Parameters{});
+    explicit ALNSUM(const InstanceUM& instance);
+    ALNSUM(const InstanceUM& instance, Parameters parameters);
 
     // Executa o ALNS completo e devolve a melhor solucao encontrada.
     Solution solve();
@@ -139,6 +154,13 @@ private:
     double cs_local_branching_seconds_ = 0.0;
     int cs_local_branching_calls_ = 0;
     int cs_local_branching_improvements_ = 0;
+
+    // Pool de solucoes de elite usado pela mineracao de padroes frequentes.
+    // Mantem as melhores solucoes distintas ja aceitas pelo ALNS para servir de base
+    // estatistica as fixacoes de variaveis aplicadas antes de cada Local Branching.
+    std::vector<Solution> elite_pool_;
+    int cs_pattern_mining_calls_ = 0;
+    long long cs_pattern_mining_variables_fixed_ = 0;
 
     // Preparacao de estruturas auxiliares derivadas da instancia.
     void buildDemandList();
@@ -230,9 +252,20 @@ private:
         Solution& improved_solution,
         int vehicle_radius,
         int demand_radius,
-        double time_limit
+        double time_limit,
+        int* mined_variables_fixed = nullptr
     ) const;
     bool applyFinalIntensification(Solution& best);
+
+    // Mineracao de padroes frequentes (Data Mining) aplicada ao Local Branching.
+    // Mantem o pool de elite atualizado e usa votacao por suporte para fixar variaveis
+    // x/y no MIP antes de cada resolucao, reduzindo o espaco de busca do solver.
+    void updateElitePool(const Solution& solution);
+    int applyMinedVariableFixings(
+        std::vector<GRBVar>& y,
+        std::vector<std::vector<std::vector<GRBVar>>>& x,
+        const std::vector<std::vector<std::vector<bool>>>& x_exists
+    ) const;
 
     // Funcoes utilitarias usadas pelos operadores.
     std::vector<Demand> getAssignedDemands(const Solution& solution) const;
