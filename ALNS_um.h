@@ -51,8 +51,9 @@ public:
         // maiores ou usar melhor o tempo disponivel.
         bool enable_pattern_mining = true;
         int pattern_mining_pool_size = 30;
-        int pattern_mining_min_pool_size = 8;
-        double pattern_mining_support_threshold = 0.9;
+        int pattern_mining_min_pool_size = 25;
+        double pattern_mining_support_threshold = 0.75;
+
     };
 
     // Representa uma demanda elementar do problema: item i exigido pelo cliente c.
