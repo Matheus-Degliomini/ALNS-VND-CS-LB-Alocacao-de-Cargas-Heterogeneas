@@ -1,5 +1,5 @@
 record_type,entity_id,objective,iterations,runtime_seconds,stop_reason,cs_calls,lb_calls,lb_improvements,cs_seconds,lb_seconds,final_seconds,final_calls,final_improvements,used,dead_freight,weight_load,weight_capacity,volume_load,volume_capacity,item_id,client_id,vehicle_id,served,prob_final,total_uses,total_accepts,failed_acceptance,total_improvements,pattern_mining_calls,pattern_mining_variables_fixed
-summary,global,71650,1498,85.7372,max_iterations_without_improvement,601,29,4,79.0165,81.211,2.20458,1,0,,,,,,,,,,,,,,,27,932
+summary,global,71650,1498,35.7244,max_iterations_without_improvement,601,29,4,34.2573,34.5813,0.325364,1,0,,,,,,,,,,,,,,,27,932
 vehicle,0,,,,,,,,,,,,,0,0,0,23000,0,40,,,,,,,,,,
 vehicle,1,,,,,,,,,,,,,1,0,55594,74000,99,100,,,,,,,,,,
 vehicle,2,,,,,,,,,,,,,1,0,31718,33000,65,70,,,,,,,,,,
